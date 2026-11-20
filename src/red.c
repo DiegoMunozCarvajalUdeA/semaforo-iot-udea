@@ -12,6 +12,7 @@
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_netif_sntp.h"
+#include "esp_random.h"
 #include "esp_wifi.h"
 #include "mqtt_client.h"
 #include "nvs_flash.h"
@@ -50,6 +51,18 @@ extern const char esp32_key_inicio[] asm("_binary_esp32_key_start");
 #define KEEPALIVE_MQTT_S 30
 #define TAMANO_JSON 256
 
+// la tarea interna de esp-mqtt (tls, reenvios) queda por debajo
+// de tarea_control (4), tarea_sensores (5) y tarea_barreras (6)
+#define PRIORIDAD_TAREA_MQTT 3
+#define PRIORIDAD_TAREA_RED 3
+
+// un registro solo se da por entregado cuando llega su PUBACK.
+// esp-mqtt borra del outbox lo no confirmado a los 30 s, asi que
+// no basta con que esp_mqtt_client_publish devuelva un id valido
+#define ESPERA_PUBACK_MS 15000
+#define LONGITUD_COLA_ACKS 8
+#define INTENTOS_RECORDADOS 8
+
 // antes de esta fecha (2024-01-01) se asume que no hay hora sincronizada
 #define EPOCA_MINIMA_VALIDA 1704067200LL
 
@@ -61,8 +74,14 @@ static const char *TAG_RED = "RED";
 
 static EventGroupHandle_t eventos_red;
 static QueueHandle_t cola_red;
+static QueueHandle_t cola_acks;
 static esp_mqtt_client_handle_t cliente_mqtt;
-static bool red_activa = false;
+static volatile bool red_activa = false;
+
+// aleatorio por arranque: (device_id, boot_id, ciclo, calle) identifica
+// cada registro aunque ciclo vuelva a 1 tras un reinicio. qos 1 puede
+// entregar duplicados y el consumidor los descarta con esta clave
+static uint32_t id_arranque;
 
 
 // --------------------------------------------------
@@ -108,10 +127,11 @@ static int formatear_json(
     return snprintf(
         json,
         tamano,
-        "{\"device_id\":\"%s\",\"ciclo\":%lu,\"calle\":\"%c\",\"ts\":%s,"
+        "{\"device_id\":\"%s\",\"boot_id\":\"%08lx\",\"ciclo\":%lu,\"calle\":\"%c\",\"ts\":%s,"
         "\"distancia_cm\":%.1f,\"prioridad\":%d,\"t_verde_s\":%d,"
         "\"vehiculos\":%d,\"flujo_veh_s\":%.2f}",
         ID_DISPOSITIVO,
+        (unsigned long)id_arranque,
         (unsigned long)registro->ciclo,
         registro->calle,
         ts,
@@ -179,6 +199,12 @@ static void manejar_mqtt(
     case MQTT_EVENT_DISCONNECTED:
         xEventGroupClearBits(eventos_red, BIT_MQTT_CONECTADO);
         ESP_LOGW(TAG_RED, "Desconectado del broker");
+        break;
+
+    case MQTT_EVENT_PUBLISHED:
+        // PUBACK recibido: avisar a tarea_red (si la cola se llena se
+        // pierde el aviso y el registro solo se reenvia)
+        xQueueSend(cola_acks, &evento->msg_id, 0);
         break;
 
     case MQTT_EVENT_ERROR:
@@ -288,6 +314,9 @@ static esp_err_t iniciar_mqtt(void)
                 .retain = 1,
             },
         },
+        .task = {
+            .priority = PRIORIDAD_TAREA_MQTT,
+        },
     };
 
     cliente_mqtt = esp_mqtt_client_init(&configuracion);
@@ -299,6 +328,104 @@ static esp_err_t iniciar_mqtt(void)
 
     // tarea_red arranca el cliente cuando haya wifi
     return esp_mqtt_client_register_event(cliente_mqtt, ESP_EVENT_ANY_ID, manejar_mqtt, NULL);
+}
+
+
+// --------------------------------------------------
+// esperar el PUBACK de cualquiera de los envios del registro actual.
+// los PUBACK de otros mensajes ("online", registros anteriores) se ignoran
+// --------------------------------------------------
+
+static bool esperar_puback(
+    const int *ids_enviados,
+    int cantidad)
+{
+    TimeOut_t inicio;
+    TickType_t restante = pdMS_TO_TICKS(ESPERA_PUBACK_MS);
+    int id_confirmado;
+
+    vTaskSetTimeOutState(&inicio);
+
+    while (xTaskCheckForTimeOut(&inicio, &restante) == pdFALSE)
+    {
+        if (xQueueReceive(cola_acks, &id_confirmado, restante) != pdTRUE)
+        {
+            break;
+        }
+
+        for (int i = 0; i < cantidad; i++)
+        {
+            if (ids_enviados[i] == id_confirmado)
+            {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+
+// --------------------------------------------------
+// publicar un registro hasta que el broker confirme (qos 1).
+// si no llega PUBACK se reenvia: puede haber duplicados, nunca perdidas
+// mientras el registro siga en la cola o en esta funcion
+// --------------------------------------------------
+
+static void publicar_hasta_confirmar(
+    const registro_calle_t *registro,
+    const char *json,
+    int longitud)
+{
+    int ids_enviados[INTENTOS_RECORDADOS];
+    int intentos = 0;
+
+    while (1)
+    {
+        xEventGroupWaitBits(
+            eventos_red,
+            BIT_MQTT_CONECTADO,
+            pdFALSE,
+            pdTRUE,
+            portMAX_DELAY);
+
+        int id_mensaje = esp_mqtt_client_publish(
+            cliente_mqtt,
+            TOPICO_TELEMETRIA,
+            json,
+            longitud,
+            1,
+            0);
+
+        if (id_mensaje < 0)
+        {
+            ESP_LOGW(TAG_RED, "Fallo la publicacion, reintentando");
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        ids_enviados[intentos % INTENTOS_RECORDADOS] = id_mensaje;
+        intentos = intentos + 1;
+
+        int recordados = (intentos < INTENTOS_RECORDADOS) ? intentos : INTENTOS_RECORDADOS;
+
+        if (esperar_puback(ids_enviados, recordados))
+        {
+            ESP_LOGI(
+                TAG_RED,
+                "Confirmado por el broker: ciclo %lu calle %c",
+                (unsigned long)registro->ciclo,
+                registro->calle);
+            return;
+        }
+
+        ESP_LOGW(
+            TAG_RED,
+            "Sin PUBACK en %d s, se reenvia ciclo %lu calle %c",
+            ESPERA_PUBACK_MS / 1000,
+            (unsigned long)registro->ciclo,
+            registro->calle);
+    }
 }
 
 
@@ -342,33 +469,7 @@ static void tarea_red(void *pvParameters)
             continue;
         }
 
-        // reintentar hasta que el broker acepte el mensaje
-        while (1)
-        {
-            xEventGroupWaitBits(
-                eventos_red,
-                BIT_MQTT_CONECTADO,
-                pdFALSE,
-                pdTRUE,
-                portMAX_DELAY);
-
-            int id_mensaje = esp_mqtt_client_publish(
-                cliente_mqtt,
-                TOPICO_TELEMETRIA,
-                json,
-                longitud,
-                1,
-                0);
-
-            if (id_mensaje >= 0)
-            {
-                ESP_LOGI(TAG_RED, "Publicado ciclo %lu calle %c", (unsigned long)registro.ciclo, registro.calle);
-                break;
-            }
-
-            ESP_LOGW(TAG_RED, "Fallo la publicacion, reintentando");
-            vTaskDelay(pdMS_TO_TICKS(1000));
-        }
+        publicar_hasta_confirmar(&registro, json, longitud);
     }
 }
 
@@ -381,10 +482,11 @@ bool red_iniciar(void)
 {
     eventos_red = xEventGroupCreate();
     cola_red = xQueueCreate(LONGITUD_COLA_RED, sizeof(registro_calle_t));
+    cola_acks = xQueueCreate(LONGITUD_COLA_ACKS, sizeof(int));
 
-    if ((eventos_red == NULL) || (cola_red == NULL))
+    if ((eventos_red == NULL) || (cola_red == NULL) || (cola_acks == NULL))
     {
-        ESP_LOGE(TAG_RED, "No se pudo crear la cola o el grupo de eventos");
+        ESP_LOGE(TAG_RED, "No se pudieron crear las colas o el grupo de eventos");
         return false;
     }
 
@@ -407,6 +509,9 @@ bool red_iniciar(void)
         return false;
     }
 
+    // con la radio encendida esp_random() usa ruido real
+    id_arranque = esp_random();
+
     esp_sntp_config_t configuracion_sntp = ESP_NETIF_SNTP_DEFAULT_CONFIG(SERVIDOR_NTP);
 
     if (esp_netif_sntp_init(&configuracion_sntp) != ESP_OK)
@@ -421,8 +526,7 @@ bool red_iniciar(void)
         return false;
     }
 
-    // prioridad 3: por debajo de control, sensores y barreras
-    if (xTaskCreate(tarea_red, "tarea_red", 4096, NULL, 3, NULL) != pdPASS)
+    if (xTaskCreate(tarea_red, "tarea_red", 4096, NULL, PRIORIDAD_TAREA_RED, NULL) != pdPASS)
     {
         ESP_LOGE(TAG_RED, "No se pudo crear tarea_red");
         return false;

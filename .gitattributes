@@ -1,0 +1,4 @@
+# Scripts y configuracion que se ejecutan en Linux/macOS: siempre LF,
+# aunque se clone en Windows con core.autocrlf=true.
+*.sh text eol=lf
+raspberry/mosquitto/* text eol=lf

@@ -11,10 +11,29 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
+error() {
+    echo "Error: $*" >&2
+    exit 1
+}
+
 for archivo in ca.crt server.crt server.key; do
-    if [[ ! -f "$RAIZ/certs/$archivo" ]]; then
-        echo "Falta certs/$archivo (genere la PKI con pki/generar_certs.sh)" >&2
-        exit 1
+    [[ -s "$RAIZ/certs/$archivo" ]] || error "falta certs/$archivo o esta vacio (genere la PKI con pki/generar_certs.sh)"
+done
+
+# el certificado debe ser de la CA, estar vigente segun el reloj de la Pi
+# ("not yet valid" = reloj atrasado) y corresponder a la llave
+openssl verify -CAfile "$RAIZ/certs/ca.crt" "$RAIZ/certs/server.crt" ||
+    error "certs/server.crt no es valido para certs/ca.crt (revise tambien la hora: date)"
+
+if [[ "$(openssl x509 -in "$RAIZ/certs/server.crt" -noout -pubkey)" != \
+      "$(openssl pkey -in "$RAIZ/certs/server.key" -pubout)" ]]; then
+    error "certs/server.key no corresponde a certs/server.crt"
+fi
+
+# mosquitto no acepta finales de linea CRLF (archivos editados en Windows)
+for archivo in raspberry/mosquitto/mtls.conf raspberry/mosquitto/acl; do
+    if grep -q $'\r' "$RAIZ/$archivo"; then
+        error "$archivo tiene finales de linea CRLF; conviertalo con: sed -i 's/\\r$//' $archivo"
     fi
 done
 
@@ -30,3 +49,6 @@ install -m 644 "$RAIZ/raspberry/mosquitto/mtls.conf" /etc/mosquitto/conf.d/mtls.
 systemctl enable mosquitto
 systemctl restart mosquitto
 systemctl --no-pager --lines=5 status mosquitto
+
+echo
+echo "Log del broker: sudo tail -f /var/log/mosquitto/mosquitto.log"

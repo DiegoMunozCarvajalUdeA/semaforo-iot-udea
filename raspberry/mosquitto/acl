@@ -1,13 +1,19 @@
 # ACL de Mosquitto. El usuario es el CN del certificado de cliente
-# (use_identity_as_username true en mtls.conf).
+# (use_identity_as_username true en mtls.conf). Cada consumidor nuevo
+# necesita su propio certificado y su propio bloque aqui.
 
-# ESP32 de la interseccion 1
+# ESP32 de la interseccion 1 (estado: "online" y last will "offline")
 user esp32-int1
 topic write semaforo/int1/telemetria
-topic readwrite semaforo/int1/estado
+topic write semaforo/int1/estado
 topic read semaforo/int1/cmd
 
-# Pruebas y consumidores de la capa de aplicacion
+# Pruebas manuales (mosquitto_sub / mosquitto_pub)
 user monitor
+topic read semaforo/#
+topic write semaforo/+/cmd
+
+# Consumidor de la capa de aplicacion
+user app
 topic read semaforo/#
 topic write semaforo/+/cmd

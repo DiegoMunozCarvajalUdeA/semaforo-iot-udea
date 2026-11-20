@@ -841,16 +841,6 @@ void app_main(void)
     inicializar_adc();
 
 
-    // la red es opcional: si falla, el semaforo sigue en modo local
-
-    if (!red_iniciar())
-    {
-        ESP_LOGW(
-            "MAIN",
-            "Capa de red no disponible, se continua en modo local");
-    }
-
-
     xTaskCreate(
         tarea_sensores,
         "tarea_sensores",
@@ -876,4 +866,15 @@ void app_main(void)
         NULL,
         4,
         NULL);
+
+
+    // la red arranca despues del semaforo y es opcional:
+    // si no inicia, el semaforo sigue en modo local
+
+    if (!red_iniciar())
+    {
+        ESP_LOGW(
+            "MAIN",
+            "Capa de red no disponible, se continua en modo local");
+    }
 }

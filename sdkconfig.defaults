@@ -1,0 +1,10 @@
+# Valores propios del proyecto (el resto queda en los defaults de ESP-IDF).
+
+# La ESP32 DevKit V1 del montaje tiene 4 MB de flash.
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+
+# Particion de aplicacion de 1.5 MB: el firmware con WiFi + TLS ya ocupa ~900 KB.
+CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
+
+# MQTT solo usa mqtts:// (TLS); los transportes websocket no se usan.
+# CONFIG_MQTT_TRANSPORT_WEBSOCKET is not set
