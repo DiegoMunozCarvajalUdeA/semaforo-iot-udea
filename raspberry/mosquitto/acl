@@ -1,0 +1,13 @@
+# ACL de Mosquitto. El usuario es el CN del certificado de cliente
+# (use_identity_as_username true en mtls.conf).
+
+# ESP32 de la interseccion 1
+user esp32-int1
+topic write semaforo/int1/telemetria
+topic readwrite semaforo/int1/estado
+topic read semaforo/int1/cmd
+
+# Pruebas y consumidores de la capa de aplicacion
+user monitor
+topic read semaforo/#
+topic write semaforo/+/cmd

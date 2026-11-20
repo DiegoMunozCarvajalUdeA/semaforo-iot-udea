@@ -14,3 +14,10 @@ test/
 *.bin
 *.elf
 .DS_Store
+
+# capa de red: credenciales y certificados locales (nunca subirlos)
+src/config_red.h
+certs/
+
+# componentes descargados por el component manager
+managed_components/

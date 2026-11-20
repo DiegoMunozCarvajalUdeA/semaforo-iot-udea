@@ -1,0 +1,4 @@
+## Dependencias del ESP Component Registry.
+## Desde ESP-IDF 6.0 el cliente MQTT ya no viene dentro de IDF.
+dependencies:
+  espressif/mqtt: "^1.1.0"

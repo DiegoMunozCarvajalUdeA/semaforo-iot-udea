@@ -10,6 +10,8 @@
 #include "esp_adc/adc_oneshot.h"
 #include "esp_log.h"
 
+#include "red.h"
+
 
 // --------------------------------------------------
 // pines de las barreras
@@ -495,8 +497,13 @@ static void tarea_control(void *pvParameters)
         pdMS_TO_TICKS(1000));
 
 
+    uint32_t ciclo = 0;
+
+
     while (1)
     {
+        ciclo = ciclo + 1;
+
         float distancia_actual_a = 80.0f;
         float distancia_actual_b = 80.0f;
         float flujo_actual_a = 0.0f;
@@ -612,6 +619,21 @@ static void tarea_control(void *pvParameters)
             nuevo_flujo_a);
 
 
+        // enviar resultado de la calle a a la raspberry (no bloquea)
+
+        registro_calle_t registro_a = {
+            .ciclo = ciclo,
+            .calle = 'A',
+            .distancia_cm = distancia_actual_a,
+            .prioridad = prioridad_a,
+            .tiempo_verde_s = tiempo_a,
+            .vehiculos = total_a,
+            .flujo = nuevo_flujo_a
+        };
+
+        red_publicar_calle(&registro_a);
+
+
         // amarillo a
 
         poner_semaforo_a(0, 1, 0);
@@ -677,6 +699,21 @@ static void tarea_control(void *pvParameters)
             total_b,
             tiempo_b,
             nuevo_flujo_b);
+
+
+        // enviar resultado de la calle b a la raspberry (no bloquea)
+
+        registro_calle_t registro_b = {
+            .ciclo = ciclo,
+            .calle = 'B',
+            .distancia_cm = distancia_actual_b,
+            .prioridad = prioridad_b,
+            .tiempo_verde_s = tiempo_b,
+            .vehiculos = total_b,
+            .flujo = nuevo_flujo_b
+        };
+
+        red_publicar_calle(&registro_b);
 
 
         // amarillo b
@@ -802,6 +839,16 @@ void app_main(void)
 
     inicializar_gpio();
     inicializar_adc();
+
+
+    // la red es opcional: si falla, el semaforo sigue en modo local
+
+    if (!red_iniciar())
+    {
+        ESP_LOGW(
+            "MAIN",
+            "Capa de red no disponible, se continua en modo local");
+    }
 
 
     xTaskCreate(
